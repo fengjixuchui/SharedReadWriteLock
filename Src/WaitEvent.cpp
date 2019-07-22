@@ -51,40 +51,56 @@ static struct KeyedEvent
 
 #elif defined(PLATFORM_IS_LINUX)
 #  include <unistd.h>
+#  include <errno.h>
 #  include <sys/time.h>
 #  include <sys/syscall.h>
 #  include <linux/futex.h>
 #endif
 
 //////////////////////////////////////////////////////////////////////////
-void WaitEvent::WaitMicrosec(uint64_t microsecs)
+bool WaitEvent::WaitMicrosec(uint64_t microsecs)
 {
 #if defined(PLATFORM_IS_WINDOWS)
+	Assert((size_t)this % 4 == 0);
 	if (microsecs == -1)
+	{
 		NtWaitForKeyedEvent(g_KeyedEvent.Handle_, this, false, nullptr);
+		return false;
+	}
 	else
 	{
 		LARGE_INTEGER timeOut;
 		timeOut.QuadPart = -static_cast<int64_t>(microsecs * 10);
-		NtWaitForKeyedEvent(g_KeyedEvent.Handle_, this, false, &timeOut);
+		return NtWaitForKeyedEvent(g_KeyedEvent.Handle_, this, false, &timeOut) == STATUS_TIMEOUT;
 	}
 #elif defined(PLATFORM_IS_LINUX)
 	if (microsecs == -1)
+	{
 		syscall(SYS_futex, &Futex_, FUTEX_WAIT_PRIVATE, Futex_, nullptr, 0, 0);
+		return false;
+	}
 	else
 	{
 		timespec ts;
 		ts.tv_sec = microsecs / 1000000;
 		ts.tv_nsec = (microsecs % 1000000) * 1000;
 		syscall(SYS_futex, &Futex_, FUTEX_WAIT_PRIVATE, Futex_, &ts, 0, 0);
+		return errno == ETIMEDOUT;
 	}
 #else
 	std::unique_lock<std::mutex> lk(Mutex_);
 	if (microsecs == -1)
+	{
 		CondVar_.wait(lk, [this] { return IsWakeUp_; });
+		IsWakeUp_ = false;
+		return false;
+	}
 	else
-		CondVar_.wait_for(lk, std::chrono::microseconds(microsecs), [this] { return IsWakeUp_; });
-	IsWakeUp_ = false;
+	{
+		auto status = CondVar_.wait_for(lk, std::chrono::microseconds(microsecs));
+		IsWakeUp_ = false;
+		return status == std::cv_status::timeout;
+	}
 #endif
 }
 
@@ -102,10 +118,8 @@ void WaitEvent::WakeUp()
 			PLATFORM_YIELD;
 	}
 #else
-	{
-		std::lock_guard<std::mutex> lk(Mutex_);
-		IsWakeUp_ = true;
-	}
+	std::lock_guard<std::mutex> lk(Mutex_);
+	IsWakeUp_ = true;
 	CondVar_.notify_one();
 #endif
 }
